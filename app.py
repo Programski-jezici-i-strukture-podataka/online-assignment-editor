@@ -4,24 +4,86 @@ import subprocess
 import tempfile
 import zipfile
 from pathlib import Path
+import uuid
+import time
 
-from flask import Flask, request, send_file, abort, render_template_string
+from flask import Flask, request, send_file, abort, render_template_string, redirect, url_for
 
 app = Flask(__name__)
 
 UPLOAD_FORM = """
 <!doctype html>
-<title>Build PDF from ZIP</title>
-<h1>Upload ZIP (must contain a directory with a Makefile)</h1>
-<form method=post enctype=multipart/form-data action="/build">
-  <input type=file name=file accept=".zip" required>
-  <input type=submit value="Build PDF">
-</form>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Build PDF</title>
+<style>
+  body {
+    font-family: sans-serif;
+    padding: 2rem;
+  }
+
+  button {
+    padding: 0.5rem 1.2rem;
+    font-size: 1rem;
+  }
+
+  #spinner {
+    display: none;
+    margin-top: 1.5rem;
+    align-items: center;
+    gap: 0.75rem;
+  }
+
+  .loader {
+    width: 28px;
+    height: 28px;
+    border: 4px solid #ddd;
+    border-top: 4px solid #333;
+    border-radius: 50%;
+    animation: spin 1s linear infinite;
+  }
+
+  @keyframes spin {
+    to { transform: rotate(360deg); }
+  }
+</style>
+
+<script>
+  function startBuild() {
+    document.getElementById("spinner").style.display = "flex";
+    document.getElementById("submitBtn").disabled = true;
+    document.getElementById("submitBtn").innerText = "Building...";
+  }
+</script>
+</head>
+
+<body>
+  <h1>Upload ZIP</h1>
+  <p>The PDF will be generated after upload.</p>
+
+  <form method="post"
+      enctype="multipart/form-data"
+      action="/build"
+      onsubmit="startBuild()">
+    <input type="file" name="file" accept=".zip" required>
+    <br><br>
+    <button id="submitBtn" type="submit">Build PDF</button>
+  </form>
+
+  <div id="spinner">
+    <div class="loader"></div>
+    <div>Building PDF, please wait…</div>
+  </div>
+</body>
+</html>
 """
 
 # Optional: cap upload size (e.g., 10 MB)
 app.config["MAX_CONTENT_LENGTH"] = 10 * 1024 * 1024
 
+JOBS: dict[str, tuple[Path, float]] = {}
+TTL_SECONDS = 15 * 60
 
 def safe_extract_zip(zip_path: Path, dest_dir: Path) -> None:
     """Extract zip into dest_dir, preventing Zip Slip path traversal."""
@@ -80,21 +142,12 @@ def pick_make_dir(extract_root: Path) -> Path:
 
 
 def find_output_pdf(make_dir: Path) -> Path:
-    """
-    Decide which PDF to return.
-    If your Makefile always produces a specific path, hardcode it here.
-    Otherwise, pick the newest .pdf under make_dir after build.
-    """
-    # Example hardcoded output (recommended if you can standardize it):
-    # out = make_dir / "out.pdf"
-    # if out.exists(): return out
+    pdf = make_dir / "build" / "pdf" / "zadatak.pdf"
 
-    pdfs = list(make_dir.rglob("*.pdf"))
-    if not pdfs:
-        raise FileNotFoundError("No PDF produced by build.")
-    pdfs.sort(key=lambda p: p.stat().st_mtime, reverse=True)
-    return pdfs[0]
+    if not pdf.exists():
+        raise ValueError("Error while trying to get the generated PDF.")
 
+    return pdf
 
 @app.get("/")
 def index():
@@ -113,7 +166,8 @@ def build():
     if not f.filename.lower().endswith(".zip"):
         abort(400, "Please upload a .zip file")
 
-    workdir = Path(tempfile.mkdtemp(prefix="job_"))
+    job_id = uuid.uuid4().hex
+    workdir = Path(tempfile.mkdtemp(prefix=f"job_{job_id}_"))
     zip_path = workdir / "upload.zip"
     extract_dir = workdir / "src"
     extract_dir.mkdir(parents=True, exist_ok=True)
@@ -147,19 +201,76 @@ def build():
 
         pdf_path = find_output_pdf(make_dir)
 
-        return send_file(
-            pdf_path,
-            mimetype="application/pdf",
-            as_attachment=True,
-            download_name=pdf_path.name if pdf_path.name else "result.pdf",
-        )
+        JOBS[job_id] = (pdf_path, time.time())
+
+        return redirect(url_for("done", job_id=job_id))
 
     except subprocess.TimeoutExpired:
+        shutil.rmtree(workdir, ignore_errors=True)
         return "Build timed out.", 504
 
-    finally:
-        shutil.rmtree(workdir, ignore_errors=True)
+@app.get("/done/<job_id>")
+def done(job_id):
+    if job_id not in JOBS:
+        abort(404)
 
+    return f"""
+    <!doctype html>
+    <html>
+    <head>
+      <title>PDF Ready</title>
+      <style>
+        body {{ font-family: sans-serif; padding: 2rem; }}
+        a {{ font-size: 1.1rem; }}
+      </style>
+    </head>
+    <body>
+      <h1>✅ PDF ready</h1>
+      <p>Your document has been generated.</p>
+      <a href="/download/{job_id}">Download PDF</a>
+      <br><br>
+      <a href="/">Build another</a>
+    </body>
+    </html>
+    """
+
+@app.get("/download/<job_id>")
+def download(job_id):
+    entry = JOBS.get(job_id)
+    if not entry:
+        abort(404)
+
+    pdf_path, _ = entry
+    if not pdf_path or not pdf_path.exists():
+        abort(404)
+
+    response = send_file(
+        pdf_path,
+        mimetype="application/pdf",
+        as_attachment=True,
+        download_name=pdf_path.name,
+    )
+
+    return response
+
+def cleanup_expired_jobs():
+    now = time.time()
+    expired = []
+
+    for job_id, (pdf_path, created) in list(JOBS.items()):
+        if now - created > TTL_SECONDS:
+            expired.append(job_id)
+
+    for job_id in expired:
+        pdf_path, _ = JOBS.pop(job_id, (None, None))
+        if pdf_path:
+            # job root = parent of Makefile dir; adjust depth if needed
+            job_root = pdf_path.parents[2]
+            shutil.rmtree(job_root, ignore_errors=True)
+
+@app.before_request
+def housekeeping():
+    cleanup_expired_jobs()
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", "5000"))
